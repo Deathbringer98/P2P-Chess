@@ -168,7 +168,7 @@ async def _webrtc_connect(signal_url: str, is_host: bool, inbound_q: "queue.Queu
 
     pc = RTCPeerConnection(configuration=RTC_CONFIG)
 
-    # Fallback: mark open when PC hits 'connected' (covers rare DC-open delays)
+    # Fallback: mark open when PC hits 'connected'
     open_flag = {"open": False}
 
     @pc.on("iceconnectionstatechange")
@@ -188,10 +188,8 @@ async def _webrtc_connect(signal_url: str, is_host: bool, inbound_q: "queue.Queu
     session = ClientSession()
     ws = await session.ws_connect(signal_url, heartbeat=20)
 
-    # Live box to hold the channel reference.
     channel_box = {"ch": None}
 
-    # Helper: single message sink that runs inside the asyncio thread
     def _push_inbound(msg):
         try:
             if isinstance(msg, bytes):
@@ -297,48 +295,29 @@ async def _webrtc_connect(signal_url: str, is_host: bool, inbound_q: "queue.Queu
 
 # ====================== Game helpers ======================
 def try_push_move(board: chess.Board, mv: chess.Move, my_color: bool):
-    """
-    Push a move onto the board.
-    - Strict mode: only legal when it's that side's turn.
-    - SANDBOX: if it's not the mover's turn, temporarily switch board.turn to the mover's
-      color so the move becomes legal.
-    """
     if mv is None:
         return False
-
     mover_piece = board.piece_at(mv.from_square)
     if mover_piece is None:
         return False
-
     mover_color = mover_piece.color
-
-    # Only allow moving your own pieces
     if mover_color != my_color:
         return False
-
     if SANDBOX and mover_color != board.turn:
-        board.turn = mover_color  # temporarily transfer turn
-
+        board.turn = mover_color
     if mv in board.legal_moves:
         board.push(mv)
         return True
-
     return False
 
 def apply_inbound_uci(board: chess.Board, uci: str):
-    """
-    Apply a received UCI move on this board.
-    In SANDBOX, if the mover isn't the side to move, flip turn first.
-    """
     try:
         mv = chess.Move.from_uci(uci)
     except Exception:
         return False
-
     piece = board.piece_at(mv.from_square)
     if SANDBOX and piece and piece.color != board.turn:
         board.turn = piece.color
-
     if mv in board.legal_moves:
         board.push(mv)
         return True
@@ -464,10 +443,11 @@ def run():
                             elif move_snd: move_snd.play()
                             try:
                                 uci = mv.uci()
-                                print("[game] sending move:", uci)
-                                chan.send(uci)
+                                print("[game] scheduling send:", uci)
+                                # SCHEDULE SEND ON ASYNCIO LOOP (thread-safe)
+                                loop.call_soon_threadsafe(chan.send, uci)
                             except Exception as ex:
-                                print("[game] send failed:", ex)
+                                print("[game] send schedule failed:", ex)
                         selected_square = None
 
         # Drain inbound queue and apply moves
