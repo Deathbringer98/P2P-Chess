@@ -1,10 +1,24 @@
 # chess_multiplayer.py
-import os, sys, json, asyncio, chess, pygame, random, string
+import os, sys, json, asyncio, random, string, queue
+import pygame
+import chess
 from threading import Thread
-from aiohttp import ClientSession, WSMsgType
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 
-# ---------- Board & assets (match offline) ----------
+from aiohttp import ClientSession, WSMsgType
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    RTCIceCandidate,
+    RTCConfiguration,
+    RTCIceServer,
+)
+
+# ====================== Options ======================
+# If True: either player may move their own pieces at any time (useful for testing).
+# If False: strict chess rules (only the side to move may move).
+SANDBOX = True
+
+# ---------- Board & assets ----------
 WIDTH, HEIGHT = 800, 800
 FPS = 60
 TILE_W, TILE_H = 84, 84
@@ -16,22 +30,38 @@ ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 PIECES_DIR = os.path.join(ASSETS_DIR, "pieces")
 AUDIO_DIR  = os.path.join(os.path.dirname(__file__), "audio")
 
-SIGNAL_HOST = "127.0.0.1"
-SIGNAL_PORT = 8080
+# ---------- Signaling + ICE config ----------
+SIGNAL_HOST = os.getenv("SIGNAL_HOST", "127.0.0.1")
+SIGNAL_PORT = int(os.getenv("SIGNAL_PORT", "8080"))
 
-# ---------- Small UI helpers ----------
+ICE_SERVERS = [
+    RTCIceServer(urls="stun:stun.l.google.com:19302"),
+    RTCIceServer(urls="stun:stun1.l.google.com:19302"),
+]
+TURN_URL  = os.getenv("TURN_URL")
+TURN_USER = os.getenv("TURN_USER")
+TURN_PASS = os.getenv("TURN_PASS")
+if TURN_URL and TURN_USER and TURN_PASS:
+    ICE_SERVERS.append(RTCIceServer(urls=TURN_URL, username=TURN_USER, credential=TURN_PASS))
+
+RTC_CONFIG = RTCConfiguration(iceServers=ICE_SERVERS)
+
+# ====================== UI helpers ======================
 def center_text(surf, text, y, font, color=(255,255,255)):
-    t = font.render(text, True, color); r = t.get_rect(center=(WIDTH//2,y)); surf.blit(t, r)
+    t = font.render(text, True, color)
+    r = t.get_rect(center=(WIDTH//2, y))
+    surf.blit(t, r)
 
 def random_room_code(n=5):
     return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(n))
 
 def ask_host_or_join(screen):
-    font = pygame.font.SysFont("arial", 30)
+    font_big  = pygame.font.SysFont("arial", 30)
+    font_small= pygame.font.SysFont("arial", 22)
     while True:
         screen.fill((15,18,22))
-        center_text(screen, "Press  H  to Host   or   J  to Join", HEIGHT//2, font)
-        center_text(screen, "ESC to cancel", HEIGHT//2 + 60, pygame.font.SysFont("arial", 22), (180,180,180))
+        center_text(screen, "Press  H  to Host   or   J  to Join", HEIGHT//2, font_big)
+        center_text(screen, "ESC to cancel", HEIGHT//2 + 60, font_small, (180,180,180))
         pygame.display.flip()
         for e in pygame.event.get():
             if e.type == pygame.QUIT: return None
@@ -42,6 +72,7 @@ def ask_host_or_join(screen):
 
 def ask_room_code(screen):
     font = pygame.font.SysFont("arial", 28)
+    helpf= pygame.font.SysFont("arial", 20)
     code = ""
     while True:
         screen.fill((15,18,22))
@@ -51,7 +82,7 @@ def ask_room_code(screen):
         pygame.draw.rect(screen, (100,110,120), box, 2, border_radius=10)
         txt = font.render(code, True, (220,220,220))
         screen.blit(txt, (box.x+10, box.y+8))
-        center_text(screen, "Enter = Join   |   ESC = Cancel", 330, pygame.font.SysFont("arial", 20), (180,180,180))
+        center_text(screen, "Enter = Join   |   ESC = Cancel", 330, helpf, (180,180,180))
         pygame.display.flip()
 
         for e in pygame.event.get():
@@ -66,15 +97,16 @@ def ask_room_code(screen):
                     if e.unicode and e.unicode.isalnum():
                         code += e.unicode.upper()
 
-# ---------- Drawing / assets ----------
+# ====================== Board / Drawing ======================
 def load_piece_images():
     pieces = {}
     fmap = {"P":"Pawn","R":"Rook","N":"Knight","B":"Bishop","Q":"Queen","K":"King"}
     for c in ["w","b"]:
-        for s,name in fmap.items():
+        for s, name in fmap.items():
             key = c+s
             pth = os.path.join(PIECES_DIR, f"{c}_{name}.png")
-            if not os.path.exists(pth): raise FileNotFoundError(pth)
+            if not os.path.exists(pth):
+                raise FileNotFoundError(pth)
             img = pygame.image.load(pth).convert_alpha()
             img = pygame.transform.smoothscale(img, (int(TILE_W*PIECE_SCALE), int(TILE_H*PIECE_SCALE)))
             pieces[key] = img
@@ -91,7 +123,7 @@ def draw_pieces(screen, board, piece_images):
         rect = pygame.Rect(OFFSET_X + col*TILE_W, OFFSET_Y + row*TILE_H, TILE_W, TILE_H)
         x = rect.x + (TILE_W - img.get_width()) // 2 + TWEAK_X
         y = rect.y + (TILE_H - img.get_height()) // 2 + TWEAK_Y
-        screen.blit(img, (x,y))
+        screen.blit(img, (x, y))
 
 def highlight_moves(screen, board, selected_square):
     if selected_square is None: return
@@ -124,36 +156,68 @@ def promotion_menu(screen, color, piece_images):
                 for r,ch in menu:
                     if r.collidepoint(e.pos): return ch
 
-# ---------- Async / WebRTC ----------
-def start_loop(loop: asyncio.AbstractEventLoop):
+# ====================== Async / WebRTC ======================
+def _start_loop(loop: asyncio.AbstractEventLoop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-async def _webrtc_connect(signal_url: str, is_host: bool):
-    """
-    Build RTCPeerConnection and WebSocket signaling.
-    Returns (pc, data_channel (maybe not open yet), closer, open_flag_dict)
-    open_flag_dict["open"] flips True when the data channel opens.
-    """
-    # Use STUN so ICE can complete (esp. on different machines)
-    pc = RTCPeerConnection(configuration={
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}
-        ]
-    })
+async def _webrtc_connect(signal_url: str, is_host: bool, inbound_q: "queue.Queue[str]"):
+    print("[webrtc] signaling url:", signal_url)
+    print("[webrtc] role:", "host" if is_host else "join")
+    print("[webrtc] ICE servers:", [s.urls for s in RTC_CONFIG.iceServers])
+
+    pc = RTCPeerConnection(configuration=RTC_CONFIG)
+
+    # Fallback: mark open when PC hits 'connected' (covers rare DC-open delays)
+    open_flag = {"open": False}
+
+    @pc.on("iceconnectionstatechange")
+    def _on_ice_state():
+        print("[webrtc] ICE state:", pc.iceConnectionState)
+
+    @pc.on("connectionstatechange")
+    def _on_conn_state():
+        print("[webrtc] PC state:", pc.connectionState)
+        if pc.connectionState == "connected":
+            open_flag["open"] = True
+
+    @pc.on("signalingstatechange")
+    def _on_sig_state():
+        print("[webrtc] signaling state:", pc.signalingState)
+
     session = ClientSession()
     ws = await session.ws_connect(signal_url, heartbeat=20)
 
-    channel = None
-    open_flag = {"open": False}
+    # Live box to hold the channel reference.
+    channel_box = {"ch": None}
+
+    # Helper: single message sink that runs inside the asyncio thread
+    def _push_inbound(msg):
+        try:
+            if isinstance(msg, bytes):
+                msg = msg.decode("utf-8", errors="ignore")
+            inbound_q.put_nowait(str(msg))
+            print("[dc] inbound -> queue:", msg)
+        except Exception as e:
+            print("[dc] inbound queue error:", e)
 
     @pc.on("datachannel")
     def on_datachannel(ch):
-        nonlocal channel
-        channel = ch
+        print("[dc] joiner got datachannel:", ch.label)
+        channel_box["ch"] = ch
+
         @ch.on("open")
         def _open():
+            print("[dc] joiner datachannel open")
             open_flag["open"] = True
+            try:
+                ch.send("__hello_from_joiner__")
+            except Exception:
+                pass
+
+        @ch.on("message")
+        def _msg(m):
+            _push_inbound(m)
 
     async def ws_reader():
         async for msg in ws:
@@ -162,13 +226,17 @@ async def _webrtc_connect(signal_url: str, is_host: bool):
             data = json.loads(msg.data)
             typ  = data.get("type")
             if typ == "offer":
+                print("[ws] got offer")
                 await pc.setRemoteDescription(RTCSessionDescription(data["sdp"], "offer"))
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
-                await ws.send_json({"type":"answer","sdp":pc.localDescription.sdp})
+                print("[ws] sending answer")
+                await ws.send_json({"type":"answer", "sdp": pc.localDescription.sdp})
             elif typ == "answer":
+                print("[ws] got answer")
                 await pc.setRemoteDescription(RTCSessionDescription(data["sdp"], "answer"))
             elif typ == "candidate":
+                print("[ws] got candidate")
                 c = data["candidate"]
                 try:
                     await pc.addIceCandidate(RTCIceCandidate(
@@ -176,30 +244,48 @@ async def _webrtc_connect(signal_url: str, is_host: bool):
                         sdpMLineIndex=c.get("sdpMLineIndex"),
                         candidate=c.get("candidate"),
                     ))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print("[ws] addIceCandidate error:", e)
+
     asyncio.create_task(ws_reader())
 
     @pc.on("icecandidate")
     async def on_icecandidate(event):
         if event.candidate:
+            print("[ws] sending candidate")
             await ws.send_json({
                 "type": "candidate",
                 "candidate": {
                     "sdpMid": event.candidate.sdpMid,
                     "sdpMLineIndex": event.candidate.sdpMLineIndex,
-                    "candidate": event.candidate.to_sdp()
+                    "candidate": event.candidate.to_sdp(),
                 }
             })
+        else:
+            print("[webrtc] ICE gathering complete")
 
     if is_host:
-        channel = pc.createDataChannel("chess")
-        @channel.on("open")
+        ch = pc.createDataChannel("chess")
+        channel_box["ch"] = ch
+        print("[dc] host created datachannel")
+
+        @ch.on("open")
         def _open():
+            print("[dc] host datachannel open")
             open_flag["open"] = True
+            try:
+                ch.send("__hello_from_host__")
+            except Exception:
+                pass
+
+        @ch.on("message")
+        def on_message(msg):
+            _push_inbound(msg)
+
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
-        await ws.send_json({"type":"offer","sdp":pc.localDescription.sdp})
+        print("[ws] sending offer")
+        await ws.send_json({"type":"offer", "sdp": pc.localDescription.sdp})
 
     async def closer():
         try: await ws.close()
@@ -207,18 +293,64 @@ async def _webrtc_connect(signal_url: str, is_host: bool):
         await session.close()
         await pc.close()
 
-    # We DO NOT block here; we return immediately and let the UI
-    # show "waiting for peer" until open_flag flips True.
-    return pc, channel, closer, open_flag
+    return pc, channel_box, closer, open_flag
 
-# ---------- Main entry ----------
+# ====================== Game helpers ======================
+def try_push_move(board: chess.Board, mv: chess.Move, my_color: bool):
+    """
+    Push a move onto the board.
+    - Strict mode: only legal when it's that side's turn.
+    - SANDBOX: if it's not the mover's turn, temporarily switch board.turn to the mover's
+      color so the move becomes legal.
+    """
+    if mv is None:
+        return False
+
+    mover_piece = board.piece_at(mv.from_square)
+    if mover_piece is None:
+        return False
+
+    mover_color = mover_piece.color
+
+    # Only allow moving your own pieces
+    if mover_color != my_color:
+        return False
+
+    if SANDBOX and mover_color != board.turn:
+        board.turn = mover_color  # temporarily transfer turn
+
+    if mv in board.legal_moves:
+        board.push(mv)
+        return True
+
+    return False
+
+def apply_inbound_uci(board: chess.Board, uci: str):
+    """
+    Apply a received UCI move on this board.
+    In SANDBOX, if the mover isn't the side to move, flip turn first.
+    """
+    try:
+        mv = chess.Move.from_uci(uci)
+    except Exception:
+        return False
+
+    piece = board.piece_at(mv.from_square)
+    if SANDBOX and piece and piece.color != board.turn:
+        board.turn = piece.color
+
+    if mv in board.legal_moves:
+        board.push(mv)
+        return True
+    return False
+
+# ====================== Main entry ======================
 def run():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Chess Multiplayer (aiortc)")
     clock = pygame.time.Clock()
 
-    # Music / SFX
     move_snd = cap_snd = None
     try:
         pygame.mixer.init()
@@ -233,7 +365,6 @@ def run():
     except Exception:
         pass
 
-    # Ask host/join
     role = ask_host_or_join(screen)
     if role is None:
         pygame.quit(); return
@@ -242,31 +373,27 @@ def run():
         room = random_room_code()
     else:
         room = ask_room_code(screen)
-        if not room:
-            pygame.quit(); return
+        if not room: pygame.quit(); return
 
     signal_url = f"ws://{SIGNAL_HOST}:{SIGNAL_PORT}/ws?room={room}"
 
-    # Spin an asyncio loop in a background thread
+    # Thread-safe inbox fed by the asyncio thread
+    inbound_q: "queue.Queue[str]" = queue.Queue()
+
+    # Run asyncio loop in background
     loop = asyncio.new_event_loop()
-    t = Thread(target=start_loop, args=(loop,), daemon=True)
-    t.start()
+    thread = Thread(target=_start_loop, args=(loop,), daemon=True)
+    thread.start()
 
-    # Start connection (non-blocking)
-    fut = asyncio.run_coroutine_threadsafe(_webrtc_connect(signal_url, role=="host"), loop)
+    fut = asyncio.run_coroutine_threadsafe(
+        _webrtc_connect(signal_url, role=="host", inbound_q=inbound_q), loop
+    )
+    pc = chan_box = closer = open_flag = None
 
-    pc = chan = closer = open_flag = None
-
-    # Waiting screen until the channel opens
     font = pygame.font.SysFont("arial", 28)
     while True:
         for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                if closer:
-                    try: asyncio.run_coroutine_threadsafe(closer(), loop).result(timeout=3)
-                    except: pass
-                pygame.quit(); return
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                 if closer:
                     try: asyncio.run_coroutine_threadsafe(closer(), loop).result(timeout=3)
                     except: pass
@@ -274,24 +401,28 @@ def run():
 
         if pc is None and fut.done():
             try:
-                pc, chan, closer, open_flag = fut.result()
+                pc, chan_box, closer, open_flag = fut.result()
             except Exception as e:
                 print("[multiplayer] connect failed:", e)
                 pygame.quit(); return
 
         screen.fill((15,18,22))
-        mode = "Hosting room" if role=="host" else "Joining room"
-        center_text(screen, mode, 200, font)
+        center_text(screen, "Hosting room" if role=="host" else "Joining room", 200, font)
         center_text(screen, f"ROOM CODE: {room}", 260, font, (100,200,255))
-        center_text(screen, "Waiting for peer...", 320, font)
+        if open_flag and open_flag.get("open"):
+            center_text(screen, "Connected. Finalizing channel...", 320, font, (180,220,180))
+        else:
+            center_text(screen, "Waiting for peer...", 320, font)
         center_text(screen, "ESC to cancel", 360, pygame.font.SysFont("arial", 20), (180,180,180))
         pygame.display.flip()
         clock.tick(30)
 
-        if open_flag and open_flag.get("open"):
-            break  # data channel open → start the game
+        if open_flag and open_flag.get("open") and chan_box and chan_box.get("ch") is not None:
+            break
 
-    # ----- Connected! Build game state -----
+    # Real channel (we send moves with it)
+    chan = chan_box["ch"]
+
     board_img = pygame.image.load(os.path.join(ASSETS_DIR, "board", "chess_board.png"))
     board_img = pygame.transform.smoothscale(board_img, (WIDTH, HEIGHT))
     pieces = load_piece_images()
@@ -299,26 +430,17 @@ def run():
     board = chess.Board()
     my_color = chess.WHITE if role == "host" else chess.BLACK
     selected_square = None
-    inbound_moves = []
 
-    @chan.on("message")
-    def on_message(data):
-        try:
-            inbound_moves.append(data)
-        except Exception:
-            pass
-
-    # ----- Main game loop -----
     running = True
     while running:
         for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                running = False
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                 running = False
 
-            if e.type == pygame.MOUSEBUTTONDOWN and board.turn == my_color:
-                x,y = e.pos
+            allow_click = True if SANDBOX else (board.turn == my_color)
+
+            if e.type == pygame.MOUSEBUTTONDOWN and allow_click:
+                x, y = e.pos
                 if (OFFSET_X <= x < OFFSET_X + 8*TILE_W) and (OFFSET_Y <= y < OFFSET_Y + 8*TILE_H):
                     col = (x - OFFSET_X) // TILE_W
                     row = 7 - ((y - OFFSET_Y) // TILE_H)
@@ -326,53 +448,55 @@ def run():
 
                     if selected_square is None:
                         p = board.piece_at(sq)
-                        if p and p.color == board.turn:
+                        if p and p.color == my_color:
                             selected_square = sq
                     else:
                         p = board.piece_at(selected_square)
                         if p and p.piece_type == chess.PAWN and chess.square_rank(sq) in [0,7]:
-                            promo = promotion_menu(screen, board.turn, pieces)
+                            promo = promotion_menu(screen, p.color, pieces)
                             mv = chess.Move(selected_square, sq, promotion=promo)
                         else:
                             mv = chess.Move(selected_square, sq)
 
-                        if mv in board.legal_moves:
+                        if try_push_move(board, mv, my_color):
+                            # sfx
                             if cap_snd and board.is_capture(mv): cap_snd.play()
                             elif move_snd: move_snd.play()
-                            board.push(mv)
                             try:
-                                chan.send(mv.uci())
-                            except Exception:
-                                pass
+                                uci = mv.uci()
+                                print("[game] sending move:", uci)
+                                chan.send(uci)
+                            except Exception as ex:
+                                print("[game] send failed:", ex)
                         selected_square = None
 
-        # Apply remote moves
-        while inbound_moves:
-            uci = inbound_moves.pop(0)
+        # Drain inbound queue and apply moves
+        while True:
             try:
-                mv = chess.Move.from_uci(uci)
-                if mv in board.legal_moves:
+                uci = inbound_q.get_nowait()
+            except queue.Empty:
+                break
+            if apply_inbound_uci(board, uci):
+                try:
+                    mv = chess.Move.from_uci(uci)
                     if cap_snd and board.is_capture(mv): cap_snd.play()
                     elif move_snd: move_snd.play()
-                    board.push(mv)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        # Draw
         draw_board(screen, board_img)
-        if board.turn == my_color:
-            highlight_moves(screen, board, selected_square)
+        highlight_moves(screen, board, selected_square)
         draw_pieces(screen, board, pieces)
         pygame.display.flip()
         clock.tick(FPS)
 
-    # Cleanup connection
-    try:
-        asyncio.run_coroutine_threadsafe(closer(), loop).result(timeout=5)
-    except Exception:
-        pass
-    try:
-        loop.call_soon_threadsafe(loop.stop)
-    except Exception:
-        pass
+    # Cleanup
+    try: asyncio.run_coroutine_threadsafe(closer(), loop).result(timeout=5)
+    except: pass
+    try: loop.call_soon_threadsafe(loop.stop)
+    except: pass
     pygame.quit()
+
+
+if __name__ == "__main__":
+    run()

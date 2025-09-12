@@ -1,4 +1,4 @@
-# run.py  (place in your Main/ folder)
+# run.py
 
 import os, sys, traceback
 
