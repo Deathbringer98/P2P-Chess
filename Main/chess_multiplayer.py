@@ -16,7 +16,7 @@ from aiortc import (
 # ====================== Options ======================
 # If True: either player may move their own pieces at any time (useful for testing).
 # If False: strict chess rules (only the side to move may move).
-SANDBOX = True
+SANDBOX = False
 
 # ---------- Board & assets ----------
 WIDTH, HEIGHT = 800, 800
